@@ -3,6 +3,7 @@
 import json
 import logging
 import time,datetime
+from datetime import datetime,timezone
 import numpy as np
 from tabulate import tabulate
 import random
@@ -55,28 +56,30 @@ class MLAdvantageDemo:
             logging.error(f"Failed to connect to MQTT broker, return code {rc}")
 
     def on_message(self, client, userdata, msg):
-        """Callback for MQTT messages"""
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
             logging.info(f"Received MQTT message on topic {msg.topic}: {payload}")
             
-            # Handle metrics updates
-            if msg.topic.startswith(self.metrics_topic):
-                device_id = msg.topic.split('/')[-1]
-                self.latest_metrics = payload.get('metrics', {})
-                logging.info(f"Metrics received for device {device_id}: {self.latest_metrics}")
-            
-            # Handle status updates (FIX: Use root payload instead of 'ml_status')
-            elif msg.topic.startswith(self.status_topic):
-                device_id = msg.topic.split('/')[-1]
-                status = payload  # Directly use the payload
+            # Handle status updates only for the target device
+            if msg.topic == f"status/{self.device_id}":
+                status = payload
                 self.training_progress = status.get('training_data_size', 0)
-                logging.info(f"Status update for device {device_id}: {status}")
+                logging.info(f"Status update for device {self.device_id}: {status}")
+                
+                # Update is_trained only if the status is for the correct device
+                if status.get('is_trained', False):
+                    self.is_trained = True
+                    logging.info("Model is trained. Proceeding with tests.")
+                else:
+                    logging.info("Model not yet trained. Waiting...")
             
-            # Handle anomalies
-            elif msg.topic.startswith(self.anomalies_topic):
-                device_id = msg.topic.split('/')[-1]
-                logging.info(f"Anomaly detected for device {device_id}: {payload}")
+            # Handle metrics and anomalies (existing logic)
+            elif msg.topic == f"metrics/{self.device_id}":
+                self.latest_metrics = payload.get('metrics', {})
+                logging.info(f"Metrics received for device {self.device_id}: {self.latest_metrics}")
+            
+            elif msg.topic == f"anomalies/{self.device_id}":
+                logging.info(f"Anomaly detected for device {self.device_id}: {payload}")
         
         except Exception as e:
             logging.error(f"Error processing MQTT message: {str(e)}")
@@ -179,30 +182,22 @@ class MLAdvantageDemo:
             # Create new device ID and API key
             self.device_id = "openwrt-23"
             self.api_key = "test-key-12345"  # Fixed API key for testing
-            
             logging.info(f"Created device {self.device_id} with API key {self.api_key}")
             return True
-
         except Exception as e:
             logging.error(f"Setup failed: {str(e)}")
             return False
 
     def control_collector(self, command: str, scenario: str = "normal"):
-        """Control the OpenWRT collector via MQTT"""
+        """Control the collector"""
         try:
-            payload = {
-                "command": command,
-                "scenario": scenario,
-                "test_mode": True
-            }
-            
-            logging.info(f"Sending control command: {command}, scenario: {scenario}")
-            print("=========>>>self.control_topic====>>>",self.control_topic,"payload=====>>>>",payload)
-            self.mqtt_client.publish(self.control_topic, json.dumps(payload))
-            
+            if command == "start":
+                self.current_scenario = scenario
+                logging.info(f"Starting collector with scenario: {scenario}")
+            elif command == "stop":
+                logging.info("Stopping collector")
         except Exception as e:
             logging.error(f"Error controlling collector: {str(e)}")
-            raise
 
     def wait_for_training(self):
         """Wait for the model to be trained and start metrics collection"""
@@ -229,35 +224,102 @@ class MLAdvantageDemo:
     def get_metrics(self):
         """Retrieve the latest metrics for the device via MQTT"""
         try:
-            # Subscribe to the metrics topic temporarily
             metrics_topic = f"metrics/{self.device_id}"
             metrics_received = None
             metrics_event = threading.Event()
 
             def on_metrics_message(client, userdata, msg):
-                """Callback to handle metrics messages"""
                 nonlocal metrics_received
                 try:
                     payload = json.loads(msg.payload.decode('utf-8'))
                     logging.info(f"Received metrics for device {self.device_id}: {payload}")
                     metrics_received = payload.get('metrics', {})
-                    metrics_event.set()  # Signal that metrics have been received
+                    metrics_event.set()
                 except Exception as e:
                     logging.error(f"Error processing metrics message: {str(e)}")
 
-            # Subscribe to the metrics topic
             self.mqtt_client.subscribe(metrics_topic)
             self.mqtt_client.message_callback_add(metrics_topic, on_metrics_message)
 
-            # Wait for the metrics response
-            if metrics_event.wait(timeout=10):  # Wait up to 10 seconds for metrics
-                return [metrics_received]  # Return as a list for compatibility
+            if metrics_event.wait(timeout=10):
+                return [metrics_received]
             else:
                 logging.error("Timeout waiting for metrics response")
                 return []
         except Exception as e:
             logging.error(f"Error retrieving metrics: {str(e)}")
             return []
+        
+
+    def get_ml_score(self, metrics: Dict) -> float:
+        """
+        Retrieve the ML score (combined_score) from the anomaly detection results.
+        """
+        try:
+            # Publish metrics to trigger anomaly detection
+            self.send_metrics(metrics)
+            time.sleep(2)  # Allow time for anomaly detection
+
+            # Subscribe to anomalies topic to get the ML score
+            anomalies_topic = f"anomalies/{self.device_id}"
+            ml_score_received = None
+            score_event = threading.Event()
+
+            def on_anomaly_message(client, userdata, msg):
+                """Callback to handle anomaly messages"""
+                nonlocal ml_score_received
+                try:
+                    payload = json.loads(msg.payload.decode('utf-8'))
+                    logging.info(f"Received anomaly for device {self.device_id}: {payload}")
+                    
+                    # Ensure payload is a list and extract the first element
+                    if isinstance(payload, list) and len(payload) > 0:
+                        anomaly = payload[0]
+                        ml_score_received = anomaly.get('score', 0)  # Extract combined_score
+                        score_event.set()  # Signal that score has been received
+                    else:
+                        logging.error(f"Unexpected payload format: {payload}")
+                except Exception as e:
+                    logging.error(f"Error processing anomaly message: {str(e)}")
+
+            # Subscribe to anomalies topic
+            self.mqtt_client.subscribe(anomalies_topic)
+            self.mqtt_client.message_callback_add(anomalies_topic, on_anomaly_message)
+
+            # Wait for the ML score response
+            if score_event.wait(timeout=10):  # Wait up to 10 seconds for the score
+                return ml_score_received
+            else:
+                logging.error("Timeout waiting for ML score")
+                return 0.0
+        except Exception as e:
+            logging.error(f"Error retrieving ML score: {str(e)}")
+        return 0.0
+        
+    def send_metrics(self, metrics: Dict):
+        """Publish metrics via MQTT"""
+        payload = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'device_id': self.device_id,
+            'metrics': metrics
+        }
+        result, mid = self.mqtt_client.publish(self.metrics_topic, json.dumps(payload))
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            logging.error(f"Failed to publish metrics: {mqtt.error_string(result)}")
+    
+    def send_control_message(self, scenario, test_mode=True):
+        """Send a control message to change the scenario."""
+        control_message = {
+            "command": "start",
+            "scenario": scenario,
+            "test_mode": test_mode
+        }
+        topic = f"control/{self.device_id}"  # Use dynamic topic based on device ID
+        result, mid = self.mqtt_client.publish(topic, json.dumps(control_message))
+        if result != mqtt.MQTT_ERR_SUCCESS:
+            logging.error(f"Failed to publish control message: {mqtt.error_string(result)}")
+        else:
+            logging.info(f"Published control message to {topic}: {control_message}")
 
     def demonstrate_advantage(self):
         """Run the ML advantage demonstration"""
@@ -281,29 +343,33 @@ class MLAdvantageDemo:
             logging.info(f"Testing scenario: {scenario_name}")
             try:
                 # Send control message to start collector with scenario
-                self.control_collector("start", scenario_type)
-                logging.info(f"Sent control message to start scenario: {scenario_type}")
-                time.sleep(10)  # Wait for metrics to flow
+                self.send_control_message(scenario_type)
                 
-                # Get latest metrics and calculate ML score
+                # Wait for confirmation that the scenario has changed
+                self.wait_for_scenario_change(scenario_type)
+                
+                # Get latest metrics and ML scores
                 metrics_data = self.get_metrics()
                 if metrics_data and len(metrics_data) > 0:
                     metrics = metrics_data[0]
                     ml_score = self.get_ml_score(metrics)
                     logging.info(f"ML score -> {ml_score}, scenario -> {scenario_type}")
                     
+                    # Format metrics for display
+                    metrics_display = json.dumps(metrics, indent=2) if metrics else "No metrics"
+                    
                     # Add result
                     results.append([
-                        time.strftime("%H:%M:%S"),
+                        datetime.now().strftime("%H:%M:%S"),
                         scenario_name,
-                        json.dumps(metrics, indent=2),
+                        metrics_display,
                         "✓" if self.check_thresholds(metrics) else "✗",
                         f"{ml_score:.3f}",
                         "✓" if ml_score > 1.0 else "✗"
                     ])
                 
                 # Stop collector
-                self.control_collector("stop")
+                self.send_control_message("normal")  # Reset to normal
                 logging.info(f"Sent control message to stop scenario: {scenario_type}")
             except Exception as e:
                 logging.error(f"Error during scenario {scenario_name}: {str(e)}")
@@ -315,6 +381,19 @@ class MLAdvantageDemo:
         logging.info("1. Threshold-based detection misses subtle combined anomalies")
         logging.info("2. ML detection identifies correlated metric changes")
         logging.info("3. Both systems detect obvious problems")
+
+    def wait_for_scenario_change(self, expected_scenario, timeout=10):
+        """Wait for the scenario to change to the expected value."""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            status = self.get_status(self.device_id)
+            current_scenario = status.get("current_scenario", "unknown")
+            if current_scenario == expected_scenario:
+                logging.info(f"Scenario changed to {expected_scenario}")
+                return True
+            time.sleep(1)
+        logging.warning(f"Timeout waiting for scenario to change to {expected_scenario}")
+        return False
 
 def main():
     demo = MLAdvantageDemo()

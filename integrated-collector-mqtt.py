@@ -83,7 +83,6 @@ class OpenWRTCollector:
         logging.warning("Disconnected from MQTT broker")
 
     def on_message(self, client, userdata, msg):
-        """Callback for MQTT messages"""
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
             logging.info(f"Received MQTT message on topic {msg.topic}: {payload}")
@@ -94,14 +93,25 @@ class OpenWRTCollector:
                 scenario = payload.get("scenario", "normal")
                 test_mode = payload.get("test_mode", True)
                 
+                # Debug log: Processing control command
+                logging.debug(f"Processing control command: {payload}")
+                
                 if command == "start":
                     logging.info(f"Changing scenario to: {scenario}")
-                    self.current_scenario = scenario
-                    self.start(test_mode=test_mode, scenario=scenario)  # Start sending metrics
+                    self.current_scenario = scenario  # Update the scenario
+                    
+                    # Debug log: Updated current_scenario
+                    logging.debug(f"Updated current_scenario to: {self.current_scenario}")
+                    
+                    self.start(test_mode=test_mode, scenario=scenario)
                 elif command == "stop":
                     logging.info("Stopping scenario")
-                    self.current_scenario = "normal"  # Reset to normal when stopped
-                    self.stop()  # Stop sending metrics
+                    self.current_scenario = "normal"  # Reset to normal
+                    
+                    # Debug log: Updated current_scenario
+                    logging.debug(f"Updated current_scenario to: {self.current_scenario}")
+                    
+                    self.stop()
         except Exception as e:
             logging.error(f"Error processing MQTT message: {str(e)}")
 
